@@ -12,7 +12,7 @@ const SALT_LEN = 32;
 const TAG_LEN = 16;
 const NONCE_LEN = 12;
 const MAX_CHUNK = 0x3fff;
-const WS_GUID = "258EAFA5-E914-47DA-95CA-5AB9DCBE11D5";
+const WS_GUID = "258EAFA5-E914-47DA-95CA-5AB5DCBE11D5";
 
 /* ─── Key derivation ─── */
 
@@ -245,7 +245,7 @@ function wsWrite(op: number, data: Buffer): Buffer {
 
 /* ─── SS session over WebSocket ─── */
 
-function ssSession(sock: net.Socket, remaining: Buffer) {
+function ssSession(sock: net.Socket, remaining: Buffer, earlyData?: Buffer | null) {
   let wsBuf = remaining.length ? Buffer.from(remaining) : Buffer.alloc(0);
   let ssBuf = Buffer.alloc(0);
   let dec: Decryptor | null = null;
@@ -255,9 +255,10 @@ function ssSession(sock: net.Socket, remaining: Buffer) {
   let addrDone = false;
   let dead = false;
 
-  function die() {
+  function die(reason?: string) {
     if (dead) return;
     dead = true;
+    console.log(`[ws] session closed (${reason || "unknown"})`);
     remote?.destroy();
     try {
       if (sock.writable) sock.end(wsWrite(0x08, Buffer.alloc(0)));
@@ -338,13 +339,35 @@ function ssSession(sock: net.Socket, remaining: Buffer) {
 
   sock.on("data", (d: Buffer) => {
     if (!dead) {
-      console.log(`[ws] data: ${d.length}B`);
+      console.log(`[ws] raw data: ${d.length}B`);
       wsBuf = Buffer.concat([wsBuf, d]);
       tick();
     }
   });
-  sock.on("error", () => die());
-  sock.on("close", () => die());
+  sock.on("error", (e) => die(`error: ${e.message}`));
+  sock.on("close", (hadError) => die(`close hadError=${hadError}`));
+  sock.on("end", () => die("end"));
+
+  // Handle early data from Sec-WebSocket-Protocol header (Xray-style)
+  if (earlyData && earlyData.length) {
+    console.log(`[ws] early data: ${earlyData.length}B`);
+    ssBuf = Buffer.concat([ssBuf, earlyData]);
+    if (ssBuf.length >= SALT_LEN) {
+      dec = new Decryptor(MASTER_KEY, ssBuf.subarray(0, SALT_LEN));
+      console.log("[ss] salt received (early)");
+      const rest = ssBuf.subarray(SALT_LEN);
+      ssBuf = Buffer.alloc(0);
+      if (rest.length) {
+        try {
+          onPlain(dec.feed(rest));
+        } catch (e: any) {
+          console.error("[ss] decrypt error (early):", e?.message);
+          die("early decrypt fail");
+          return;
+        }
+      }
+    }
+  }
 
   if (wsBuf.length) tick();
 }
@@ -402,15 +425,27 @@ const server = net.createServer((sock) => {
       const wsKey = headers["sec-websocket-key"];
       if (!wsKey) { sock.destroy(); return; }
 
+      const wsSub = headers["sec-websocket-protocol"];
+      let earlyData: Buffer | null = null;
+      let echoProto = "";
+      if (wsSub) {
+        // Xray-style early data: first SS payload is base64-encoded in the protocol header
+        try {
+          earlyData = Buffer.from(wsSub, "base64");
+          echoProto = `Sec-WebSocket-Protocol: ${wsSub}\r\n`;
+        } catch {}
+      }
+
       sock.write(
         "HTTP/1.1 101 Switching Protocols\r\n" +
           "Upgrade: websocket\r\n" +
           "Connection: Upgrade\r\n" +
           `Sec-WebSocket-Accept: ${wsAccept(wsKey)}\r\n` +
+          echoProto +
           "\r\n"
       );
-      console.log(`[ws] handshake complete (${headers["x-forwarded-for"] || sock.remoteAddress})`);
-      ssSession(sock, body);
+      console.log(`[ws] handshake complete (${headers["x-forwarded-for"] || sock.remoteAddress}) proto=${wsSub || "none"}`);
+      ssSession(sock, body, earlyData);
       return;
     }
 
