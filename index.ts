@@ -710,26 +710,33 @@ const server = net.createServer((sock) => {
       return;
     }
 
-    // Route: XHTTP GET → download stream
-    const xhttpBase = XHTTP_PATH.endsWith("/") ? XHTTP_PATH : XHTTP_PATH + "/";
+    // Route: XHTTP — path format: /xhttp/{uuid} (GET) or /xhttp/{uuid}/{seq} (POST)
+    const xhttpPrefix = XHTTP_PATH.endsWith("/") ? XHTTP_PATH : XHTTP_PATH + "/";
     const clientIp = headers["x-forwarded-for"] || sock.remoteAddress || "unknown";
-    if (method === "GET" && (urlPath === XHTTP_PATH || urlPath === xhttpBase) && qp.session && isValidUUID(qp.session)) {
-      handleXHTTPGet(sock, qp.session, clientIp);
-      return;
-    }
+    if (urlPath.startsWith(xhttpPrefix)) {
+      const rest = urlPath.substring(xhttpPrefix.length);  // e.g. "uuid" or "uuid/0"
+      const segments = rest.split("/").filter(Boolean);
 
-    // Route: XHTTP POST → upload
-    if (method === "POST" && (urlPath === XHTTP_PATH || urlPath === xhttpBase) && qp.session && isValidUUID(qp.session) && qp.seq !== undefined) {
-      const seq = parseInt(qp.seq, 10);
-      if (isNaN(seq) || seq < 0) {
-        sock.end("HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request");
+      if (segments.length === 1 && isValidUUID(segments[0]) && method === "GET") {
+        handleXHTTPGet(sock, segments[0], clientIp);
         return;
       }
-      handleXHTTPPost(sock, qp.session, seq, headers, body, clientIp);
-      return;
+
+      if (segments.length === 2 && isValidUUID(segments[0]) && method === "POST") {
+        const seq = parseInt(segments[1], 10);
+        if (isNaN(seq) || seq < 0) {
+          sock.end("HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request");
+          return;
+        }
+        handleXHTTPPost(sock, segments[0], seq, headers, body, clientIp);
+        return;
+      }
+
+      console.log(`[xhttp] unmatched ${method} ${urlPath} (${clientIp})`);
     }
 
     // Everything else → 404
+    console.log(`[http] 404 ${method} ${urlPath}`);
     sock.end("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found");
   }
 
