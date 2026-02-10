@@ -12,7 +12,6 @@ const SALT_LEN = 32;
 const TAG_LEN = 16;
 const NONCE_LEN = 12;
 const MAX_CHUNK = 0x3fff;
-const WS_GUID = "258EAFA5-E914-47DA-95CA-5AB5DCBE11D5";
 
 /* ─── XHTTP/SplitHTTP configuration ─── */
 
@@ -473,193 +472,6 @@ function handleXHTTPPost(
   }
 }
 
-/* ─── WebSocket ─── */
-
-function wsAccept(key: string): string {
-  return crypto
-    .createHash("sha1")
-    .update(key.trim() + WS_GUID)
-    .digest("base64");
-}
-
-function wsRead(
-  buf: Buffer
-): { op: number; data: Buffer; len: number } | null {
-  if (buf.length < 2) return null;
-  const op = buf[0] & 0x0f;
-  const masked = !!(buf[1] & 0x80);
-  let plen = buf[1] & 0x7f;
-  let off = 2;
-  if (plen === 126) {
-    if (buf.length < 4) return null;
-    plen = buf.readUInt16BE(2);
-    off = 4;
-  } else if (plen === 127) {
-    if (buf.length < 10) return null;
-    plen = Number(buf.readBigUInt64BE(2));
-    off = 10;
-  }
-  const mlen = masked ? 4 : 0;
-  if (buf.length < off + mlen + plen) return null;
-  let data: Buffer;
-  if (masked) {
-    const mask = buf.subarray(off, off + 4);
-    off += 4;
-    data = Buffer.alloc(plen);
-    for (let i = 0; i < plen; i++) data[i] = buf[off + i] ^ mask[i & 3];
-  } else {
-    data = Buffer.from(buf.subarray(off, off + plen));
-  }
-  return { op, data, len: off + plen };
-}
-
-function wsWrite(op: number, data: Buffer): Buffer {
-  let hdr: Buffer;
-  if (data.length < 126) {
-    hdr = Buffer.from([0x80 | op, data.length]);
-  } else if (data.length < 0x10000) {
-    hdr = Buffer.alloc(4);
-    hdr[0] = 0x80 | op;
-    hdr[1] = 126;
-    hdr.writeUInt16BE(data.length, 2);
-  } else {
-    hdr = Buffer.alloc(10);
-    hdr[0] = 0x80 | op;
-    hdr[1] = 127;
-    hdr.writeBigUInt64BE(BigInt(data.length), 2);
-  }
-  return Buffer.concat([hdr, data]);
-}
-
-/* ─── SS session over WebSocket ─── */
-
-function ssSession(sock: net.Socket, remaining: Buffer, earlyData?: Buffer | null) {
-  let wsBuf = remaining.length ? Buffer.from(remaining) : Buffer.alloc(0);
-  let ssBuf = Buffer.alloc(0);
-  let dec: Decryptor | null = null;
-  let enc: Encryptor | null = null;
-  let remote: net.Socket | null = null;
-  let addrBuf = Buffer.alloc(0);
-  let addrDone = false;
-  let dead = false;
-
-  function die(reason?: string) {
-    if (dead) return;
-    dead = true;
-    console.log(`[ws] session closed (${reason || "unknown"})`);
-    remote?.destroy();
-    try {
-      if (sock.writable) sock.end(wsWrite(0x08, Buffer.alloc(0)));
-    } catch {}
-  }
-
-  function toClient(plain: Buffer) {
-    if (dead || !sock.writable) return;
-    if (!enc) {
-      enc = new Encryptor(MASTER_KEY);
-      sock.write(
-        wsWrite(0x02, Buffer.concat([enc.salt, enc.write(plain)]))
-      );
-    } else {
-      sock.write(wsWrite(0x02, enc.write(plain)));
-    }
-  }
-
-  function onPlain(chunks: Buffer[]) {
-    for (const c of chunks) {
-      if (!addrDone) {
-        addrBuf = Buffer.concat([addrBuf, c]);
-        const a = parseAddr(addrBuf);
-        if (!a) continue;
-        addrDone = true;
-        const rest = addrBuf.subarray(a.len);
-        console.log(`[ss] → ${a.host}:${a.port}`);
-        remote = net.createConnection(a.port, a.host, () => {
-          if (rest.length) remote!.write(rest);
-        });
-        remote.on("data", (d: Buffer) => toClient(d));
-        remote.on("error", die);
-        remote.on("close", die);
-      } else {
-        remote?.write(c);
-      }
-    }
-  }
-
-  function tick() {
-    while (true) {
-      const f = wsRead(wsBuf);
-      if (!f) break;
-      wsBuf = wsBuf.subarray(f.len);
-
-      if (f.op === 0x08) { die(); return; }
-      if (f.op === 0x09) { sock.write(wsWrite(0x0a, f.data)); continue; }
-      if (f.op === 0x02 || f.op === 0x00) {
-        console.log(`[ss] frame len=${f.data.length}`);
-        if (!dec) {
-          ssBuf = Buffer.concat([ssBuf, f.data]);
-          if (ssBuf.length < SALT_LEN) continue;
-          console.log("[ss] salt received");
-          dec = new Decryptor(MASTER_KEY, ssBuf.subarray(0, SALT_LEN));
-          const rest = ssBuf.subarray(SALT_LEN);
-          ssBuf = Buffer.alloc(0);
-          if (rest.length) {
-            try {
-              onPlain(dec.feed(rest));
-            } catch (e: any) {
-              console.error("[ss] decrypt error:", e?.message);
-              die();
-              return;
-            }
-          }
-        } else {
-          try {
-            onPlain(dec.feed(f.data));
-          } catch (e: any) {
-            console.error("[ss] decrypt error:", e?.message);
-            die();
-            return;
-          }
-        }
-      }
-    }
-  }
-
-  sock.on("data", (d: Buffer) => {
-    if (!dead) {
-      console.log(`[ws] raw data: ${d.length}B`);
-      wsBuf = Buffer.concat([wsBuf, d]);
-      tick();
-    }
-  });
-  sock.on("error", (e) => die(`error: ${e.message}`));
-  sock.on("close", (hadError) => die(`close hadError=${hadError}`));
-  sock.on("end", () => die("end"));
-
-  // Handle early data from Sec-WebSocket-Protocol header (Xray-style)
-  if (earlyData && earlyData.length) {
-    console.log(`[ws] early data: ${earlyData.length}B`);
-    ssBuf = Buffer.concat([ssBuf, earlyData]);
-    if (ssBuf.length >= SALT_LEN) {
-      dec = new Decryptor(MASTER_KEY, ssBuf.subarray(0, SALT_LEN));
-      console.log("[ss] salt received (early)");
-      const rest = ssBuf.subarray(SALT_LEN);
-      ssBuf = Buffer.alloc(0);
-      if (rest.length) {
-        try {
-          onPlain(dec.feed(rest));
-        } catch (e: any) {
-          console.error("[ss] decrypt error (early):", e?.message);
-          die("early decrypt fail");
-          return;
-        }
-      }
-    }
-  }
-
-  if (wsBuf.length) tick();
-}
-
 /* ─── Raw TCP server (bypass Node.js HTTP module) ─── */
 
 const HTML = fs.readFileSync(path.join(process.cwd(), "public", "index.html"), "utf-8");
@@ -705,39 +517,6 @@ const server = net.createServer((sock) => {
       return;
     }
 
-    // Route: WebSocket upgrade on /ws
-    if (
-      method === "GET" &&
-      urlPath === "/ws" &&
-      headers["upgrade"]?.toLowerCase() === "websocket"
-    ) {
-      const wsKey = headers["sec-websocket-key"];
-      if (!wsKey) { sock.destroy(); return; }
-
-      const wsSub = headers["sec-websocket-protocol"];
-      let earlyData: Buffer | null = null;
-      let echoProto = "";
-      if (wsSub) {
-        // Xray-style early data: first SS payload is base64-encoded in the protocol header
-        try {
-          earlyData = Buffer.from(wsSub, "base64");
-          echoProto = `Sec-WebSocket-Protocol: ${wsSub}\r\n`;
-        } catch {}
-      }
-
-      sock.write(
-        "HTTP/1.1 101 Switching Protocols\r\n" +
-          "Upgrade: websocket\r\n" +
-          "Connection: Upgrade\r\n" +
-          `Sec-WebSocket-Accept: ${wsAccept(wsKey)}\r\n` +
-          echoProto +
-          "\r\n"
-      );
-      console.log(`[ws] handshake complete (${headers["x-forwarded-for"] || sock.remoteAddress}) proto=${wsSub || "none"}`);
-      ssSession(sock, body, earlyData);
-      return;
-    }
-
     // Route: XHTTP — path format: /xhttp/{uuid} (GET) or /xhttp/{uuid}/{seq} (POST)
     const xhttpPrefix = XHTTP_PATH.endsWith("/") ? XHTTP_PATH : XHTTP_PATH + "/";
     const clientIp = headers["x-forwarded-for"] || sock.remoteAddress || "unknown";
@@ -773,7 +552,7 @@ const server = net.createServer((sock) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Listening on :${PORT}  ws=/ws  xhttp=${XHTTP_PATH}`);
+  console.log(`Listening on :${PORT}  xhttp=${XHTTP_PATH}`);
 });
 
 // XHTTP session cleanup
