@@ -3,6 +3,21 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 
+/* ─── Load .env ─── */
+
+try {
+  const envPath = path.join(process.cwd(), ".env");
+  for (const line of fs.readFileSync(envPath, "utf-8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    const key = trimmed.substring(0, eq).trim();
+    const val = trimmed.substring(eq + 1).trim();
+    if (!(key in process.env)) process.env[key] = val;
+  }
+} catch {}
+
 /* ─── Configuration ─── */
 
 const PORT = parseInt(process.env.SERVER_PORT || "20087");
