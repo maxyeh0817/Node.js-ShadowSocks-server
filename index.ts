@@ -402,6 +402,9 @@ function handleXHTTPGet(sock: net.Socket, sessionId: string, clientIp: string) {
   }
 
   s.downSock = sock;
+  sock.setKeepAlive(true, 10_000);
+  sock.setNoDelay(true);
+  const xpad = crypto.randomBytes(100 + Math.floor(Math.random() * 156)).toString("base64");
   sock.write(
     "HTTP/1.1 200 OK\r\n" +
     "Content-Type: application/octet-stream\r\n" +
@@ -409,6 +412,7 @@ function handleXHTTPGet(sock: net.Socket, sessionId: string, clientIp: string) {
     "X-Accel-Buffering: no\r\n" +
     "Cache-Control: no-store\r\n" +
     "Connection: keep-alive\r\n" +
+    `X-Padding: ${xpad}\r\n` +
     "\r\n"
   );
   s.downReady = true;
