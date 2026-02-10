@@ -34,7 +34,8 @@ const XHTTP_PATH = process.env.XHTTP_PATH || "/xhttp";
 const XHTTP_SESSION_TIMEOUT = 120_000;
 const XHTTP_MAX_PENDING = 64;
 const XHTTP_CLEANUP_INTERVAL = 30_000;
-const XHTTP_MAX_BUFFER = 4 * 1024 * 1024;  // 4MB buffer limit per session
+const XHTTP_MAX_BUFFER = 512 * 1024;  // 512KB buffer limit per session
+const XHTTP_MAX_SESSIONS = 200;  // max concurrent sessions for 512MB RAM
 const VERBOSE = process.env.VERBOSE !== "false";
 
 /* ─── Key derivation ─── */
@@ -250,15 +251,22 @@ function isValidUUID(s: string): boolean {
 
 function writeChunk(sock: net.Socket, data: Buffer): boolean {
   if (!sock.writable) return false;
-  sock.write(data.length.toString(16) + "\r\n");
-  sock.write(data);
-  sock.write("\r\n");
+  const header = data.length.toString(16) + "\r\n";
+  const frame = Buffer.allocUnsafe(header.length + data.length + 2);
+  frame.write(header, 0);
+  data.copy(frame, header.length);
+  frame.write("\r\n", header.length + data.length);
+  sock.write(frame);
   return true;
 }
 
 /* ─── XHTTP/SplitHTTP transport ─── */
 
-function createXHTTPSession(id: string): XHTTPSession {
+function createXHTTPSession(id: string): XHTTPSession | null {
+  if (xhttpSessions.size >= XHTTP_MAX_SESSIONS) {
+    VERBOSE && console.log(`[xhttp] session limit reached (${XHTTP_MAX_SESSIONS}), rejecting id=${id}`);
+    return null;
+  }
   const s: XHTTPSession = {
     id,
     dead: false,
@@ -306,6 +314,10 @@ function xhttpSendToClient(s: XHTTPSession, plain: Buffer) {
   }
   if (s.downSock && s.downReady) {
     writeChunk(s.downSock, encrypted);
+    // Backpressure: pause remote if downSock write buffer is backing up
+    if (s.downSock.writableLength > 64 * 1024 && s.remote) {
+      s.remote.pause();
+    }
   } else {
     s.bufferSize += encrypted.length;
     if (s.bufferSize > XHTTP_MAX_BUFFER) {
@@ -404,7 +416,7 @@ function handleXHTTPGet(sock: net.Socket, sessionId: string, clientIp: string) {
   let s = xhttpSessions.get(sessionId);
   if (!s) s = createXHTTPSession(sessionId);
 
-  if (s.dead) {
+  if (!s || s.dead) {
     VERBOSE && console.log(`[xhttp] GET on dead session id=${sessionId}`);
     sock.end("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found");
     return;
@@ -443,6 +455,11 @@ function handleXHTTPGet(sock: net.Socket, sessionId: string, clientIp: string) {
   s.earlyEncryptedData = [];
   s.bufferSize = 0;
 
+  // Backpressure: when downSock drains, resume remote reading
+  sock.on("drain", () => {
+    if (s && !s.dead && s.remote) s.remote.resume();
+  });
+
   // GET error/close is NOT fatal — allow reconnection
   sock.on("error", (err) => xhttpDetachGet(s!, `error: ${(err as any)?.message || err}`));
   sock.on("close", () => xhttpDetachGet(s!, "close"));
@@ -459,7 +476,7 @@ function handleXHTTPPost(
   let s = xhttpSessions.get(sessionId);
   if (!s) s = createXHTTPSession(sessionId);
 
-  if (s.dead) {
+  if (!s || s.dead) {
     VERBOSE && console.log(`[xhttp] POST on dead session seq=${seq} id=${sessionId}`);
     sock.end("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found");
     return;
