@@ -1,12 +1,11 @@
 # Shadowsocks AEAD Server
 
-Zero-dependency Shadowsocks server with WebSocket and XHTTP transport, built on raw Node.js TCP sockets. Designed to run behind reverse proxies and CDN (e.g. Cloudflare).
+Zero-dependency Shadowsocks server with XHTTP transport, built on raw Node.js TCP sockets. Designed to run behind reverse proxies and CDN (e.g. Cloudflare).
 
 ## Features
 
 - **Shadowsocks AEAD** (aes-256-gcm)
-- **WebSocket transport** — standard WS upgrade on `/ws`, supports Xray-style early data
-- **XHTTP/SplitHTTP transport** — pure HTTP GET/POST, works through any HTTP proxy/CDN that doesn't support WebSocket
+- **XHTTP/SplitHTTP transport** — pure HTTP GET/POST, works through any HTTP proxy/CDN
 - No external dependencies — only Node.js built-in modules
 
 ## Environment Variables
@@ -23,7 +22,7 @@ Zero-dependency Shadowsocks server with WebSocket and XHTTP transport, built on 
 
 ```bash
 node index.js
-# Listening on :20087  ws=/ws  xhttp=/xhttp
+# Listening on :20087  xhttp=/xhttp
 ```
 
 Or with custom config:
@@ -37,7 +36,6 @@ The server exposes:
 | Method | Path | Description |
 |---|---|---|
 | GET | `/` | Static HTML page |
-| GET | `/ws` | WebSocket Shadowsocks tunnel |
 | GET | `/xhttp/{uuid}` | XHTTP download stream |
 | POST | `/xhttp/{uuid}/{seq}` | XHTTP upload packets |
 
@@ -50,14 +48,6 @@ server {
 
     ssl_certificate     /path/to/cert.pem;
     ssl_certificate_key /path/to/key.pem;
-
-    location /ws {
-        proxy_pass http://127.0.0.1:20087;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }
 
     location /xhttp/ {
         proxy_pass http://127.0.0.1:20087;
@@ -73,9 +63,7 @@ server {
 
 ## Client Configuration (v2rayNG)
 
-### Transport: XHTTP (Recommended for CDN)
-
-Use XHTTP when your hosting provider's reverse proxy doesn't support WebSocket data forwarding.
+### Transport: XHTTP
 
 ```
 Protocol:       Shadowsocks
@@ -88,26 +76,6 @@ Transport:      xhttp
 XHTTP Mode:     auto
 XHTTP Host:     your.domain.com
 XHTTP Path:     /xhttp
-
-TLS:            tls
-SNI:            your.domain.com
-Fingerprint:    chrome
-ALPN:           h2,http/1.1
-AllowInsecure:  false
-```
-
-### Transport: WebSocket
-
-```
-Protocol:       Shadowsocks
-Server:         your.domain.com
-Port:           443
-Password:       <your SS_PASSWORD>
-Encryption:     aes-256-gcm
-
-Transport:      ws
-WS Host:        your.domain.com
-WS Path:        /ws
 
 TLS:            tls
 SNI:            your.domain.com
@@ -166,7 +134,6 @@ This Server (:20087)
   │
   ├─ GET  /xhttp/{uuid}      → chunked streaming (download)
   ├─ POST /xhttp/{uuid}/{seq} → upload packets
-  ├─ GET  /ws (Upgrade)       → WebSocket tunnel
   │
   │  SS AEAD decrypt
   ▼
