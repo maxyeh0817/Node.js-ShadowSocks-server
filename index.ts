@@ -568,7 +568,7 @@ const server = net.createServer((sock) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Listening on :${PORT}  xhttp=${XHTTP_PATH}`);
+  console.log(`Listening on :${PORT}`);
 });
 
 // XHTTP session cleanup
