@@ -20,6 +20,7 @@ const XHTTP_PATH = process.env.XHTTP_PATH || "/xhttp";
 const XHTTP_SESSION_TIMEOUT = 120_000;
 const XHTTP_MAX_PENDING = 64;
 const XHTTP_CLEANUP_INTERVAL = 30_000;
+const XHTTP_MAX_BUFFER = 4 * 1024 * 1024;  // 4MB buffer limit per session
 
 /* ─── Key derivation ─── */
 
@@ -175,6 +176,7 @@ interface XHTTPSession {
   addrBuf: Buffer;
   addrDone: boolean;
   earlyEncryptedData: Buffer[];
+  bufferSize: number;
 }
 
 const xhttpSessions = new Map<string, XHTTPSession>();
@@ -257,6 +259,7 @@ function createXHTTPSession(id: string): XHTTPSession {
     addrBuf: Buffer.alloc(0),
     addrDone: false,
     earlyEncryptedData: [],
+    bufferSize: 0,
   };
   xhttpSessions.set(id, s);
   console.log(`[xhttp] session created: ${id}`);
@@ -289,7 +292,13 @@ function xhttpSendToClient(s: XHTTPSession, plain: Buffer) {
   if (s.downSock && s.downReady) {
     writeChunk(s.downSock, encrypted);
   } else {
-    console.log(`[xhttp] ← buffered (GET not ready yet) ${encrypted.length}B id=${s.id}`);
+    s.bufferSize += encrypted.length;
+    if (s.bufferSize > XHTTP_MAX_BUFFER) {
+      console.log(`[xhttp] buffer overflow ${s.bufferSize}B, killing session id=${s.id}`);
+      xhttpDie(s, "buffer overflow");
+      return;
+    }
+    console.log(`[xhttp] ← buffered (GET not ready) ${encrypted.length}B total=${s.bufferSize}B id=${s.id}`);
     s.earlyEncryptedData.push(encrypted);
   }
 }
@@ -369,6 +378,13 @@ function xhttpProcessUpload(s: XHTTPSession, seq: number, payload: Buffer) {
   }
 }
 
+function xhttpDetachGet(s: XHTTPSession, reason: string) {
+  if (s.dead) return;
+  console.log(`[xhttp] GET stream lost (${reason}), awaiting reconnect id=${s.id}`);
+  s.downSock = null;
+  s.downReady = false;
+}
+
 function handleXHTTPGet(sock: net.Socket, sessionId: string, clientIp: string) {
   let s = xhttpSessions.get(sessionId);
   if (!s) s = createXHTTPSession(sessionId);
@@ -377,6 +393,12 @@ function handleXHTTPGet(sock: net.Socket, sessionId: string, clientIp: string) {
     console.log(`[xhttp] GET on dead session id=${sessionId}`);
     sock.end("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found");
     return;
+  }
+
+  // Support GET reconnection: detach old socket
+  if (s.downSock) {
+    console.log(`[xhttp] GET reconnect (replacing old stream) id=${sessionId}`);
+    try { s.downSock.destroy(); } catch {}
   }
 
   s.downSock = sock;
@@ -392,17 +414,19 @@ function handleXHTTPGet(sock: net.Socket, sessionId: string, clientIp: string) {
   s.downReady = true;
   console.log(`[xhttp] GET stream connected (${clientIp}) id=${sessionId}`);
 
-  // flush any data that arrived before GET
+  // flush any buffered data
   if (s.earlyEncryptedData.length > 0) {
-    console.log(`[xhttp] flushing ${s.earlyEncryptedData.length} buffered chunks id=${sessionId}`);
+    console.log(`[xhttp] flushing ${s.earlyEncryptedData.length} buffered chunks (${s.bufferSize}B) id=${sessionId}`);
   }
   for (const buf of s.earlyEncryptedData) {
     writeChunk(sock, buf);
   }
   s.earlyEncryptedData = [];
+  s.bufferSize = 0;
 
-  sock.on("error", () => xhttpDie(s!, "down error"));
-  sock.on("close", () => xhttpDie(s!, "down close"));
+  // GET error/close is NOT fatal — allow reconnection
+  sock.on("error", (err) => xhttpDetachGet(s!, `error: ${(err as any)?.message || err}`));
+  sock.on("close", () => xhttpDetachGet(s!, "close"));
 }
 
 function handleXHTTPPost(
