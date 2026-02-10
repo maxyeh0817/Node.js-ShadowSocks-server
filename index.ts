@@ -20,6 +20,7 @@ const XHTTP_SESSION_TIMEOUT = 120_000;
 const XHTTP_MAX_PENDING = 64;
 const XHTTP_CLEANUP_INTERVAL = 30_000;
 const XHTTP_MAX_BUFFER = 4 * 1024 * 1024;  // 4MB buffer limit per session
+const VERBOSE = process.env.VERBOSE !== "false";
 
 /* ─── Key derivation ─── */
 
@@ -261,14 +262,14 @@ function createXHTTPSession(id: string): XHTTPSession {
     bufferSize: 0,
   };
   xhttpSessions.set(id, s);
-  console.log(`[xhttp] session created: ${id}`);
+  VERBOSE && console.log(`[xhttp] session created: ${id}`);
   return s;
 }
 
 function xhttpDie(s: XHTTPSession, reason?: string) {
   if (s.dead) return;
   s.dead = true;
-  console.log(`[xhttp] session closed (${reason || "unknown"}) id=${s.id}`);
+  VERBOSE && console.log(`[xhttp] session closed (${reason || "unknown"}) id=${s.id}`);
   s.remote?.destroy();
   if (s.downSock?.writable) {
     try { s.downSock.write("0\r\n\r\n"); s.downSock.end(); } catch {}
@@ -283,21 +284,21 @@ function xhttpSendToClient(s: XHTTPSession, plain: Buffer) {
   if (!s.enc) {
     s.enc = new Encryptor(MASTER_KEY);
     encrypted = Buffer.concat([s.enc.salt, s.enc.write(plain)]);
-    console.log(`[xhttp] ← first reply ${plain.length}B plain, ${encrypted.length}B enc (inc salt) id=${s.id}`);
+    VERBOSE && console.log(`[xhttp] ← first reply ${plain.length}B plain, ${encrypted.length}B enc (inc salt) id=${s.id}`);
   } else {
     encrypted = s.enc.write(plain);
-    console.log(`[xhttp] ← reply ${plain.length}B plain, ${encrypted.length}B enc id=${s.id}`);
+    VERBOSE && console.log(`[xhttp] ← reply ${plain.length}B plain, ${encrypted.length}B enc id=${s.id}`);
   }
   if (s.downSock && s.downReady) {
     writeChunk(s.downSock, encrypted);
   } else {
     s.bufferSize += encrypted.length;
     if (s.bufferSize > XHTTP_MAX_BUFFER) {
-      console.log(`[xhttp] buffer overflow ${s.bufferSize}B, killing session id=${s.id}`);
+      VERBOSE && console.log(`[xhttp] buffer overflow ${s.bufferSize}B, killing session id=${s.id}`);
       xhttpDie(s, "buffer overflow");
       return;
     }
-    console.log(`[xhttp] ← buffered (GET not ready) ${encrypted.length}B total=${s.bufferSize}B id=${s.id}`);
+    VERBOSE && console.log(`[xhttp] ← buffered (GET not ready) ${encrypted.length}B total=${s.bufferSize}B id=${s.id}`);
     s.earlyEncryptedData.push(encrypted);
   }
 }
@@ -310,11 +311,11 @@ function xhttpOnPlain(s: XHTTPSession, chunks: Buffer[]) {
       if (!a) continue;
       s.addrDone = true;
       const rest = s.addrBuf.subarray(a.len);
-      console.log(`[ss] → ${a.host}:${a.port}`);
+      VERBOSE && console.log(`[ss] → ${a.host}:${a.port}`);
       s.remote = net.createConnection(a.port, a.host, () => {
-        console.log(`[xhttp] remote connected → ${a!.host}:${a!.port} id=${s.id}`);
+        VERBOSE && console.log(`[xhttp] remote connected → ${a!.host}:${a!.port} id=${s.id}`);
         if (rest.length) {
-          console.log(`[xhttp] → remote initial ${rest.length}B id=${s.id}`);
+          VERBOSE && console.log(`[xhttp] → remote initial ${rest.length}B id=${s.id}`);
           s.remote!.write(rest);
         }
       });
@@ -322,7 +323,7 @@ function xhttpOnPlain(s: XHTTPSession, chunks: Buffer[]) {
       s.remote.on("error", (e) => xhttpDie(s, `remote error: ${e.message}`));
       s.remote.on("close", () => xhttpDie(s, "remote close"));
     } else {
-      console.log(`[xhttp] → remote ${c.length}B id=${s.id}`);
+      VERBOSE && console.log(`[xhttp] → remote ${c.length}B id=${s.id}`);
       s.remote?.write(c);
     }
   }
@@ -333,7 +334,7 @@ function xhttpProcessUpload(s: XHTTPSession, seq: number, payload: Buffer) {
   s.lastActivity = Date.now();
 
   if (seq < s.nextSeq) {
-    console.log(`[xhttp] duplicate seq=${seq} (expect ${s.nextSeq}), ignored id=${s.id}`);
+    VERBOSE && console.log(`[xhttp] duplicate seq=${seq} (expect ${s.nextSeq}), ignored id=${s.id}`);
     return;
   }
   if (seq > s.nextSeq) {
@@ -341,7 +342,7 @@ function xhttpProcessUpload(s: XHTTPSession, seq: number, payload: Buffer) {
       xhttpDie(s, "too many pending posts");
       return;
     }
-    console.log(`[xhttp] out-of-order seq=${seq} (expect ${s.nextSeq}), queued (pending=${s.pendingPosts.size + 1}) id=${s.id}`);
+    VERBOSE && console.log(`[xhttp] out-of-order seq=${seq} (expect ${s.nextSeq}), queued (pending=${s.pendingPosts.size + 1}) id=${s.id}`);
     s.pendingPosts.set(seq, payload);
     return;
   }
@@ -356,30 +357,30 @@ function xhttpProcessUpload(s: XHTTPSession, seq: number, payload: Buffer) {
     s.nextSeq++;
     drained++;
   }
-  if (drained > 0) console.log(`[xhttp] drained ${drained} pending packets, nextSeq=${s.nextSeq} id=${s.id}`);
+  if (drained > 0) VERBOSE && console.log(`[xhttp] drained ${drained} pending packets, nextSeq=${s.nextSeq} id=${s.id}`);
 
   for (const data of toProcess) {
     if (!s.dec) {
       s.ssBuf = Buffer.concat([s.ssBuf, data]);
       if (s.ssBuf.length < SALT_LEN) continue;
-      console.log("[ss] salt received (xhttp)");
+      VERBOSE && console.log("[ss] salt received (xhttp)");
       s.dec = new Decryptor(MASTER_KEY, s.ssBuf.subarray(0, SALT_LEN));
       const rest = s.ssBuf.subarray(SALT_LEN);
       s.ssBuf = Buffer.alloc(0);
       if (rest.length) {
         try { xhttpOnPlain(s, s.dec.feed(rest)); }
-        catch (e: any) { console.error("[ss] decrypt error:", e?.message); xhttpDie(s, "decrypt"); return; }
+        catch (e: any) { VERBOSE && console.error("[ss] decrypt error:", e?.message); xhttpDie(s, "decrypt"); return; }
       }
     } else {
       try { xhttpOnPlain(s, s.dec.feed(data)); }
-      catch (e: any) { console.error("[ss] decrypt error:", e?.message); xhttpDie(s, "decrypt"); return; }
+      catch (e: any) { VERBOSE && console.error("[ss] decrypt error:", e?.message); xhttpDie(s, "decrypt"); return; }
     }
   }
 }
 
 function xhttpDetachGet(s: XHTTPSession, reason: string) {
   if (s.dead) return;
-  console.log(`[xhttp] GET stream lost (${reason}), awaiting reconnect id=${s.id}`);
+  VERBOSE && console.log(`[xhttp] GET stream lost (${reason}), awaiting reconnect id=${s.id}`);
   s.downSock = null;
   s.downReady = false;
 }
@@ -389,14 +390,14 @@ function handleXHTTPGet(sock: net.Socket, sessionId: string, clientIp: string) {
   if (!s) s = createXHTTPSession(sessionId);
 
   if (s.dead) {
-    console.log(`[xhttp] GET on dead session id=${sessionId}`);
+    VERBOSE && console.log(`[xhttp] GET on dead session id=${sessionId}`);
     sock.end("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found");
     return;
   }
 
   // Support GET reconnection: detach old socket
   if (s.downSock) {
-    console.log(`[xhttp] GET reconnect (replacing old stream) id=${sessionId}`);
+    VERBOSE && console.log(`[xhttp] GET reconnect (replacing old stream) id=${sessionId}`);
     try { s.downSock.destroy(); } catch {}
   }
 
@@ -415,11 +416,11 @@ function handleXHTTPGet(sock: net.Socket, sessionId: string, clientIp: string) {
     "\r\n"
   );
   s.downReady = true;
-  console.log(`[xhttp] GET stream connected (${clientIp}) id=${sessionId}`);
+  VERBOSE && console.log(`[xhttp] GET stream connected (${clientIp}) id=${sessionId}`);
 
   // flush any buffered data
   if (s.earlyEncryptedData.length > 0) {
-    console.log(`[xhttp] flushing ${s.earlyEncryptedData.length} buffered chunks (${s.bufferSize}B) id=${sessionId}`);
+    VERBOSE && console.log(`[xhttp] flushing ${s.earlyEncryptedData.length} buffered chunks (${s.bufferSize}B) id=${sessionId}`);
   }
   for (const buf of s.earlyEncryptedData) {
     writeChunk(sock, buf);
@@ -444,7 +445,7 @@ function handleXHTTPPost(
   if (!s) s = createXHTTPSession(sessionId);
 
   if (s.dead) {
-    console.log(`[xhttp] POST on dead session seq=${seq} id=${sessionId}`);
+    VERBOSE && console.log(`[xhttp] POST on dead session seq=${seq} id=${sessionId}`);
     sock.end("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found");
     return;
   }
@@ -452,7 +453,7 @@ function handleXHTTPPost(
   const contentLength = parseInt(headers["content-length"] || "0", 10);
 
   function finish(fullBody: Buffer) {
-    console.log(`[xhttp] POST seq=${seq} len=${fullBody.length} (${clientIp}) id=${sessionId}`);
+    VERBOSE && console.log(`[xhttp] POST seq=${seq} len=${fullBody.length} (${clientIp}) id=${sessionId}`);
     xhttpProcessUpload(s!, seq, fullBody);
     sock.end("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
   }
@@ -539,7 +540,7 @@ const server = net.createServer((sock) => {
         return;
       }
 
-      console.log(`[xhttp] unmatched ${method} ${urlPath} (${clientIp})`);
+      VERBOSE && console.log(`[xhttp] unmatched ${method} ${urlPath} (${clientIp})`);
     }
 
     // Everything else → 404
