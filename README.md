@@ -151,9 +151,9 @@ Target Server (e.g. google.com:443)
 
 **Limits and backpressure:**
 - Each POST body may be at most 1 MiB (`413` otherwise); keep the client's `scMaxEachPostBytes` at or below this (xray default: 1,000,000).
-- POST connections are kept alive and may carry pipelined requests. A request's headers must complete within 15s; a POST body must arrive within 15s + 1s per 32 KiB of Content-Length; an idle keep-alive connection is closed after 60s.
+- POST connections are kept alive and may carry pipelined requests. A request's headers must complete within 15s; a POST body must arrive within 15s + 1s per 32 KiB of Content-Length. Idle keep-alive connections have no timeout (xray's upload pool reuses them at any time); when more than 256 are idle, the oldest is closed. Requests are parsed strictly: malformed or ambiguous headers (conflicting Content-Length, obs-fold, non-token names) get `400`, and `Transfer-Encoding` gets `411`; both close the connection.
 - Received upload bytes (in-flight POST bodies plus out-of-order packets) share a 64 MiB process-wide budget; when it is full, new body data is answered with `503`.
-- Out-of-order packets are queued per session up to 30 packets (xray's `scMaxBufferedPosts` default) or 32 MiB; beyond that the session is closed.
+- Out-of-order packets are queued per session up to 30 packets (xray's `scMaxBufferedPosts` default) or 32 MiB; beyond that the session is closed. If the missing packet does not arrive within 20s, the session is closed. Only packets that advance the sequence (and downstream traffic) count as session activity.
 - When the target reads slower than the client uploads, the server stops reading the POST connection once more than 1 MiB is waiting for the target, and resumes when it drains. xray's uploader waits for each POST to be written before sending the next, so this throttles it. A client that opens a fresh connection per POST bypasses this; if more than 16 MiB ends up waiting for the target, the session is closed (large uploads to a slow target get disconnected).
 
 ## License

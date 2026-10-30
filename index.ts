@@ -37,7 +37,8 @@ const MAX_CHUNK = 0x3fff;
 const XHTTP_PATH = process.env.XHTTP_PATH || "/xhttp";
 const XHTTP_SESSION_TIMEOUT = 120_000;
 const XHTTP_MAX_PENDING = 30;  // out-of-order posts per session; same default as xray scMaxBufferedPosts
-const XHTTP_CLEANUP_INTERVAL = 30_000;
+const XHTTP_CLEANUP_INTERVAL = 5_000;
+const XHTTP_PENDING_MAX_AGE = 20_000;  // kill session if out-of-order posts wait this long for the gap
 const XHTTP_MAX_BUFFER = 512 * 1024;  // 512KB buffer limit per session
 const XHTTP_MAX_SESSIONS = 200;  // max concurrent sessions for 512MB RAM
 const XHTTP_MAX_POST_BODY = 1024 * 1024;  // per POST; client post size must stay below this
@@ -46,7 +47,12 @@ const XHTTP_MAX_UPLOAD_MEMORY = 64 * 1024 * 1024;  // global: received POST body
 const XHTTP_REMOTE_HIGH_WATER = 1024 * 1024;  // stop reading POST sockets while remote buffer is above
 const XHTTP_REMOTE_MAX_BUFFER = 16 * 1024 * 1024;  // kill session if remote write buffer exceeds
 const HTTP_HEADER_TIMEOUT = 15_000;  // a request's headers must complete within this window
-const HTTP_KEEPALIVE_TIMEOUT = 60_000;  // idle keep-alive connection waiting for its next request
+// No idle timeout for keep-alive connections: xray's upload pool reuses connections at any
+// later time, never reads responses, and a write onto a connection we closed is reported to
+// it as success, so the POST would be lost. Instead the oldest idle connection is closed once
+// more than HTTP_MAX_IDLE_CONNS are idle.
+const HTTP_MAX_IDLE_CONNS = 256;
+const HTTP_RESPONSE_HIGH_WATER = 64 * 1024;  // stop parsing requests while unread responses exceed
 const HTTP_BODY_BASE_TIMEOUT = 15_000;  // POST body deadline = base + contentLength / min rate
 const HTTP_BODY_MIN_RATE = 32 * 1024;  // bytes per second
 const VERBOSE = process.env.VERBOSE !== "false";
@@ -62,9 +68,15 @@ const FATAL_WINDOW = 60_000;
 const FATAL_MAX_ERRORS = 5;
 const FATAL_MIN_UPTIME = 90_000;
 const fatalTimes: number[] = [];
+let started = false;  // set once the server is listening
 
 function onFatal(kind: string, err: unknown) {
   console.error(`[fatal] ${kind}:`, err);
+  if (!started) {
+    // e.g. public/index.html missing: without this the process would end with exit code 0
+    console.error("[fatal] error during startup, exiting");
+    process.exit(1);
+  }
   const now = Date.now();
   fatalTimes.push(now);
   while (fatalTimes.length && fatalTimes[0] <= now - FATAL_WINDOW) fatalTimes.shift();
@@ -228,6 +240,7 @@ interface XHTTPSession {
   nextSeq: number;
   pendingPosts: Map<number, Buffer>;
   pendingBytes: number;
+  pendingSince: number;  // when the current gap in the sequence started waiting (0 = no pending)
   blockedUploads: (() => void)[];
   dec: Decryptor | null;
   enc: Encryptor | null;
@@ -326,6 +339,7 @@ function createXHTTPSession(id: string): XHTTPSession | null {
     nextSeq: 0,
     pendingPosts: new Map(),
     pendingBytes: 0,
+    pendingSince: 0,
     blockedUploads: [],
     dec: null,
     enc: null,
@@ -438,7 +452,8 @@ function xhttpOnPlain(s: XHTTPSession, chunks: Buffer[]) {
 
 function xhttpProcessUpload(s: XHTTPSession, seq: number, payload: Buffer) {
   if (s.dead) return;
-  s.lastActivity = Date.now();
+  // lastActivity only moves when the sequence advances (below): duplicate or out-of-order
+  // posts must not keep a session, and the memory it pins, alive
 
   if (seq < s.nextSeq) {
     VERBOSE && console.log(`[xhttp] duplicate seq=${seq} (expect ${s.nextSeq}), ignored id=${s.id}`);
@@ -463,6 +478,7 @@ function xhttpProcessUpload(s: XHTTPSession, seq: number, payload: Buffer) {
     }
     VERBOSE && console.log(`[xhttp] out-of-order seq=${seq} (expect ${s.nextSeq}), queued (pending=${s.pendingPosts.size + 1}) id=${s.id}`);
     s.pendingPosts.set(seq, payload);
+    if (!s.pendingSince) s.pendingSince = Date.now();
     s.pendingBytes += payload.length;
     xhttpUploadBytes += payload.length;
     return;
@@ -471,6 +487,7 @@ function xhttpProcessUpload(s: XHTTPSession, seq: number, payload: Buffer) {
   // seq === nextSeq: process this and drain consecutive pending
   const toProcess: Buffer[] = [payload];
   s.nextSeq++;
+  s.lastActivity = Date.now();
   let drained = 0;
   while (s.pendingPosts.has(s.nextSeq)) {
     const queued = s.pendingPosts.get(s.nextSeq)!;
@@ -482,6 +499,8 @@ function xhttpProcessUpload(s: XHTTPSession, seq: number, payload: Buffer) {
     drained++;
   }
   if (drained > 0) VERBOSE && console.log(`[xhttp] drained ${drained} pending packets, nextSeq=${s.nextSeq} id=${s.id}`);
+  // Progress was made: whatever is still pending waits on a new gap
+  s.pendingSince = s.pendingPosts.size ? Date.now() : 0;
 
   for (const data of toProcess) {
     if (s.dead) return;
@@ -698,6 +717,20 @@ function handleXHTTPPost(
 
 const HTML = fs.readFileSync(path.join(process.cwd(), "public", "index.html"), "utf-8");
 
+// Idle keep-alive connections in least-recently-used order (Set keeps insertion order)
+const idleConns = new Set<net.Socket>();
+
+function markIdle(sock: net.Socket) {
+  idleConns.delete(sock);
+  idleConns.add(sock);
+  if (idleConns.size > HTTP_MAX_IDLE_CONNS) {
+    const oldest = idleConns.values().next().value!;
+    idleConns.delete(oldest);
+    VERBOSE && console.log(`[http] more than ${HTTP_MAX_IDLE_CONNS} idle connections, closing oldest (${oldest.remoteAddress})`);
+    oldest.destroy();
+  }
+}
+
 const server = net.createServer((sock) => {
   let buf = Buffer.alloc(0);
   let detached = false;  // socket ended or handed over to a GET stream; ignore further input
@@ -723,8 +756,18 @@ const server = net.createServer((sock) => {
     next(rest: Buffer) {
       if (sock.destroyed || detached) return;
       buf = rest;
+      // Backpressure: a client that pipelines requests but never reads the responses would
+      // grow the write buffer without bound; stop reading until it drains
+      if (sock.writableLength > HTTP_RESPONSE_HIGH_WATER) {
+        sock.pause();
+        sock.once("drain", () => {
+          sock.resume();
+          conn.next(buf);
+        });
+        return;
+      }
       idle = true;
-      arm(HTTP_KEEPALIVE_TIMEOUT, "keep-alive idle");
+      markIdle(sock);
       parseNext();
     },
     end(response: string) {
@@ -741,7 +784,8 @@ const server = net.createServer((sock) => {
     if (detached || conn.sink || sock.destroyed || !buf.length) return;
     if (idle) {
       idle = false;
-      arm(HTTP_HEADER_TIMEOUT, "header");
+      idleConns.delete(sock);
+      arm(HTTP_HEADER_TIMEOUT, "header");  // a started request must complete its headers
     }
 
     // wait for complete HTTP headers
@@ -756,15 +800,38 @@ const server = net.createServer((sock) => {
     const body = buf.subarray(idx + 4); // data after headers (body and/or pipelined requests)
     buf = Buffer.alloc(0);
     const lines = headerPart.split("\r\n");
-    const [method, rawUrl, version] = (lines[0] || "").split(" ");
-    const { path: urlPath, params: qp } = parseQueryParams(rawUrl || "/");
+    const requestLine = (lines[0] || "").split(" ");
+    const [method, rawUrl, version] = requestLine;
 
-    // parse headers
+    // Strict parsing: behind a shared reverse proxy, any ambiguity about where a request ends
+    // could desync request boundaries (smuggling). Reject and close instead of guessing.
+    let malformed = requestLine.length !== 3 || !/^[A-Z]+$/.test(method) ||
+      !rawUrl.startsWith("/") || (version !== "HTTP/1.1" && version !== "HTTP/1.0");
     const headers: Record<string, string> = {};
-    for (let i = 1; i < lines.length; i++) {
-      const sep = lines[i].indexOf(": ");
-      if (sep > 0) headers[lines[i].substring(0, sep).toLowerCase()] = lines[i].substring(sep + 2);
+    for (let i = 1; i < lines.length && !malformed; i++) {
+      const line = lines[i];
+      const sep = line.indexOf(":");
+      const name = sep > 0 ? line.substring(0, sep) : "";
+      // header name must be a token: rejects obs-fold continuation lines, "Name : v", bare CR/LF
+      if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) || /[\r\n]/.test(line)) {
+        malformed = true;
+        break;
+      }
+      const key = name.toLowerCase();
+      const value = line.substring(sep + 1).trim();  // whitespace around the value is optional
+      if (key === "content-length" && key in headers && headers[key] !== value) {
+        malformed = true;  // conflicting duplicate Content-Length
+        break;
+      }
+      headers[key] = value;
     }
+    if (malformed) {
+      VERBOSE && console.log(`[http] 400 malformed request (${sock.remoteAddress})`);
+      conn.end("HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request");
+      return;
+    }
+    const { path: urlPath, params: qp } = parseQueryParams(rawUrl);
+    // x-forwarded-for can be spoofed behind a proxy: clientIp is used for log output only
     const connHeader = (headers["connection"] || "").toLowerCase();
     const keepAlive = version === "HTTP/1.1" ? !connHeader.includes("close") : connHeader.includes("keep-alive");
 
@@ -818,6 +885,7 @@ const server = net.createServer((sock) => {
   sock.on("error", () => sock.destroy());
   sock.on("close", () => {
     disarm();
+    idleConns.delete(sock);
     conn.onClose?.();
     conn.onClose = null;
   });
@@ -833,6 +901,7 @@ server.on("error", (err) => {
 });
 
 server.listen(PORT, () => {
+  started = true;
   console.log(`Listening on :${PORT}`);
 });
 
@@ -842,6 +911,8 @@ setInterval(() => {
   for (const [id, s] of xhttpSessions) {
     if (now - s.lastActivity > XHTTP_SESSION_TIMEOUT) {
       xhttpDie(s, "timeout");
+    } else if (s.pendingSince && now - s.pendingSince > XHTTP_PENDING_MAX_AGE) {
+      xhttpDie(s, "pending posts expired");
     }
   }
 }, XHTTP_CLEANUP_INTERVAL);
