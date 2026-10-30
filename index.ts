@@ -21,7 +21,11 @@ try {
 /* ─── Configuration ─── */
 
 const PORT = parseInt(process.env.SERVER_PORT || "20087");
-const PASSWORD = process.env.SS_PASSWORD || "test123456";
+const PASSWORD = process.env.SS_PASSWORD || "";
+if (!PASSWORD) {
+  console.error("[fatal] SS_PASSWORD is not set (env or .env), refusing to start");
+  process.exit(1);
+}
 const KEY_LEN = 32;
 const SALT_LEN = 32;
 const TAG_LEN = 16;
@@ -36,7 +40,25 @@ const XHTTP_MAX_PENDING = 64;
 const XHTTP_CLEANUP_INTERVAL = 30_000;
 const XHTTP_MAX_BUFFER = 512 * 1024;  // 512KB buffer limit per session
 const XHTTP_MAX_SESSIONS = 200;  // max concurrent sessions for 512MB RAM
+const XHTTP_MAX_POST_BODY = 1024 * 1024;  // per POST; client post size must stay below this
+const XHTTP_MAX_PENDING_BYTES = 4 * 1024 * 1024;  // out-of-order bytes queued per session
+const XHTTP_MAX_UPLOAD_MEMORY = 64 * 1024 * 1024;  // global: in-flight POST bodies + pending posts
+const XHTTP_REMOTE_HIGH_WATER = 1024 * 1024;  // hold POST acks while remote write buffer is above
+const XHTTP_REMOTE_MAX_BUFFER = 16 * 1024 * 1024;  // kill session if remote write buffer exceeds
+const HTTP_HEADER_TIMEOUT = 15_000;  // full request headers must arrive within this window
+const HTTP_BODY_IDLE_TIMEOUT = 15_000;  // POST body idle limit
 const VERBOSE = process.env.VERBOSE !== "false";
+
+/* ─── Last-resort error handlers ─── */
+// Known throw sites are handled at the source; these only keep the process alive
+// (and logged) if something unexpected slips through.
+
+process.on("uncaughtException", (err) => {
+  console.error("[fatal] uncaughtException (process kept alive):", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[fatal] unhandledRejection (process kept alive):", reason);
+});
 
 /* ─── Key derivation ─── */
 
@@ -185,6 +207,8 @@ interface XHTTPSession {
   downReady: boolean;
   nextSeq: number;
   pendingPosts: Map<number, Buffer>;
+  pendingBytes: number;
+  heldAcks: net.Socket[];
   dec: Decryptor | null;
   enc: Encryptor | null;
   ssBuf: Buffer;
@@ -196,6 +220,7 @@ interface XHTTPSession {
 }
 
 const xhttpSessions = new Map<string, XHTTPSession>();
+let xhttpUploadBytes = 0;  // bytes reserved by in-flight POST bodies + pending posts (all sessions)
 
 /* ─── Target address (SOCKS5 format) ─── */
 
@@ -233,14 +258,19 @@ function parseAddr(
 
 /* ─── XHTTP utilities ─── */
 
+// decodeURIComponent throws URIError on malformed input (e.g. "%"); keep the raw text instead
+function safeDecode(s: string): string {
+  try { return decodeURIComponent(s); } catch { return s; }
+}
+
 function parseQueryParams(rawUrl: string): { path: string; params: Record<string, string> } {
   const qIdx = rawUrl.indexOf("?");
   if (qIdx === -1) return { path: rawUrl, params: {} };
   const path = rawUrl.substring(0, qIdx);
-  const params: Record<string, string> = {};
+  const params: Record<string, string> = Object.create(null);
   for (const pair of rawUrl.substring(qIdx + 1).split("&")) {
     const eq = pair.indexOf("=");
-    if (eq > 0) params[decodeURIComponent(pair.substring(0, eq))] = decodeURIComponent(pair.substring(eq + 1));
+    if (eq > 0) params[safeDecode(pair.substring(0, eq))] = safeDecode(pair.substring(eq + 1));
   }
   return { path, params };
 }
@@ -275,6 +305,8 @@ function createXHTTPSession(id: string): XHTTPSession | null {
     downReady: false,
     nextSeq: 0,
     pendingPosts: new Map(),
+    pendingBytes: 0,
+    heldAcks: [],
     dec: null,
     enc: null,
     ssBuf: Buffer.alloc(0),
@@ -297,12 +329,27 @@ function xhttpDie(s: XHTTPSession, reason?: string) {
   if (s.downSock?.writable) {
     try { s.downSock.write("0\r\n\r\n"); s.downSock.end(); } catch {}
   }
+  xhttpUploadBytes -= s.pendingBytes;
+  s.pendingBytes = 0;
   s.pendingPosts.clear();
+  xhttpFlushAcks(s);
   xhttpSessions.delete(s.id);
+}
+
+const POST_OK = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+// Release POST acks held back by remote backpressure (remote drained or session died)
+function xhttpFlushAcks(s: XHTTPSession) {
+  const held = s.heldAcks;
+  s.heldAcks = [];
+  for (const sock of held) {
+    if (!sock.destroyed) sock.end(POST_OK);
+  }
 }
 
 function xhttpSendToClient(s: XHTTPSession, plain: Buffer) {
   if (s.dead) return;
+  s.lastActivity = Date.now();  // downstream traffic keeps the session alive too
   let encrypted: Buffer;
   if (!s.enc) {
     s.enc = new Encryptor(MASTER_KEY);
@@ -312,8 +359,8 @@ function xhttpSendToClient(s: XHTTPSession, plain: Buffer) {
     encrypted = s.enc.write(plain);
     VERBOSE && console.log(`[xhttp] ← reply ${plain.length}B plain, ${encrypted.length}B enc id=${s.id}`);
   }
-  if (s.downSock && s.downReady) {
-    writeChunk(s.downSock, encrypted);
+  // writeChunk fails if the GET socket is already closing; fall through to buffering
+  if (s.downSock && s.downReady && writeChunk(s.downSock, encrypted)) {
     // Backpressure: pause remote if downSock write buffer is backing up
     if (s.downSock.writableLength > 64 * 1024 && s.remote) {
       s.remote.pause();
@@ -334,8 +381,18 @@ function xhttpOnPlain(s: XHTTPSession, chunks: Buffer[]) {
   for (const c of chunks) {
     if (!s.addrDone) {
       s.addrBuf = Buffer.concat([s.addrBuf, c]);
+      const atyp = s.addrBuf[0];
+      if (s.addrBuf.length && atyp !== 1 && atyp !== 3 && atyp !== 4) {
+        // parseAddr would return null forever and addrBuf would grow without bound
+        xhttpDie(s, `bad address type ${atyp}`);
+        return;
+      }
       const a = parseAddr(s.addrBuf);
       if (!a) continue;
+      if (a.port === 0) {
+        xhttpDie(s, "bad target port 0");
+        return;
+      }
       s.addrDone = true;
       const rest = s.addrBuf.subarray(a.len);
       VERBOSE && console.log(`[ss] → ${a.host}:${a.port}`);
@@ -347,11 +404,16 @@ function xhttpOnPlain(s: XHTTPSession, chunks: Buffer[]) {
         }
       });
       s.remote.on("data", (d: Buffer) => xhttpSendToClient(s, d));
+      s.remote.on("drain", () => xhttpFlushAcks(s));
       s.remote.on("error", (e) => xhttpDie(s, `remote error: ${e.message}`));
       s.remote.on("close", () => xhttpDie(s, "remote close"));
     } else {
       VERBOSE && console.log(`[xhttp] → remote ${c.length}B id=${s.id}`);
       s.remote?.write(c);
+    }
+    if (s.remote && s.remote.writableLength > XHTTP_REMOTE_MAX_BUFFER) {
+      xhttpDie(s, `remote write buffer overflow ${s.remote.writableLength}B`);
+      return;
     }
   }
 }
@@ -365,12 +427,26 @@ function xhttpProcessUpload(s: XHTTPSession, seq: number, payload: Buffer) {
     return;
   }
   if (seq > s.nextSeq) {
+    if (s.pendingPosts.has(seq)) {
+      VERBOSE && console.log(`[xhttp] duplicate pending seq=${seq}, ignored id=${s.id}`);
+      return;
+    }
     if (s.pendingPosts.size >= XHTTP_MAX_PENDING) {
       xhttpDie(s, "too many pending posts");
       return;
     }
+    if (s.pendingBytes + payload.length > XHTTP_MAX_PENDING_BYTES) {
+      xhttpDie(s, "too many pending bytes");
+      return;
+    }
+    if (xhttpUploadBytes + payload.length > XHTTP_MAX_UPLOAD_MEMORY) {
+      xhttpDie(s, "global upload memory exhausted");
+      return;
+    }
     VERBOSE && console.log(`[xhttp] out-of-order seq=${seq} (expect ${s.nextSeq}), queued (pending=${s.pendingPosts.size + 1}) id=${s.id}`);
     s.pendingPosts.set(seq, payload);
+    s.pendingBytes += payload.length;
+    xhttpUploadBytes += payload.length;
     return;
   }
 
@@ -379,7 +455,10 @@ function xhttpProcessUpload(s: XHTTPSession, seq: number, payload: Buffer) {
   s.nextSeq++;
   let drained = 0;
   while (s.pendingPosts.has(s.nextSeq)) {
-    toProcess.push(s.pendingPosts.get(s.nextSeq)!);
+    const queued = s.pendingPosts.get(s.nextSeq)!;
+    toProcess.push(queued);
+    s.pendingBytes -= queued.length;
+    xhttpUploadBytes -= queued.length;
     s.pendingPosts.delete(s.nextSeq);
     s.nextSeq++;
     drained++;
@@ -387,6 +466,7 @@ function xhttpProcessUpload(s: XHTTPSession, seq: number, payload: Buffer) {
   if (drained > 0) VERBOSE && console.log(`[xhttp] drained ${drained} pending packets, nextSeq=${s.nextSeq} id=${s.id}`);
 
   for (const data of toProcess) {
+    if (s.dead) return;
     if (!s.dec) {
       s.ssBuf = Buffer.concat([s.ssBuf, data]);
       if (s.ssBuf.length < SALT_LEN) continue;
@@ -405,8 +485,9 @@ function xhttpProcessUpload(s: XHTTPSession, seq: number, payload: Buffer) {
   }
 }
 
-function xhttpDetachGet(s: XHTTPSession, reason: string) {
-  if (s.dead) return;
+function xhttpDetachGet(s: XHTTPSession, sock: net.Socket, reason: string) {
+  // A replaced (reconnected) GET socket closing must not detach its successor
+  if (s.dead || s.downSock !== sock) return;
   VERBOSE && console.log(`[xhttp] GET stream lost (${reason}), awaiting reconnect id=${s.id}`);
   s.downSock = null;
   s.downReady = false;
@@ -455,14 +536,17 @@ function handleXHTTPGet(sock: net.Socket, sessionId: string, clientIp: string) {
   s.earlyEncryptedData = [];
   s.bufferSize = 0;
 
+  // Remote may have been paused by the previous GET socket, whose drain will never fire now
+  if (s.remote && sock.writableLength <= 64 * 1024) s.remote.resume();
+
   // Backpressure: when downSock drains, resume remote reading
   sock.on("drain", () => {
-    if (s && !s.dead && s.remote) s.remote.resume();
+    if (s && !s.dead && s.remote && s.downSock === sock) s.remote.resume();
   });
 
   // GET error/close is NOT fatal — allow reconnection
-  sock.on("error", (err) => xhttpDetachGet(s!, `error: ${(err as any)?.message || err}`));
-  sock.on("close", () => xhttpDetachGet(s!, "close"));
+  sock.on("error", (err) => xhttpDetachGet(s!, sock, `error: ${(err as any)?.message || err}`));
+  sock.on("close", () => xhttpDetachGet(s!, sock, "close"));
 }
 
 function handleXHTTPPost(
@@ -473,6 +557,24 @@ function handleXHTTPPost(
   body: Buffer,
   clientIp: string
 ) {
+  // Validate Content-Length before creating any session state
+  const rawLength = (headers["content-length"] || "0").trim();
+  if (!/^\d+$/.test(rawLength)) {
+    sock.end("HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request");
+    return;
+  }
+  const contentLength = Number(rawLength);
+  if (contentLength > XHTTP_MAX_POST_BODY) {
+    VERBOSE && console.log(`[xhttp] POST too large (${contentLength}B) seq=${seq} (${clientIp}) id=${sessionId}`);
+    sock.end("HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    return;
+  }
+  if (xhttpUploadBytes + contentLength > XHTTP_MAX_UPLOAD_MEMORY) {
+    VERBOSE && console.log(`[xhttp] upload memory budget full, rejecting POST seq=${seq} id=${sessionId}`);
+    sock.end("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    return;
+  }
+
   let s = xhttpSessions.get(sessionId);
   if (!s) s = createXHTTPSession(sessionId);
 
@@ -482,26 +584,49 @@ function handleXHTTPPost(
     return;
   }
 
-  const contentLength = parseInt(headers["content-length"] || "0", 10);
+  // Reserve the declared body size in the global upload budget until the body is consumed
+  xhttpUploadBytes += contentLength;
+  let reserved = true;
+  const release = () => {
+    if (!reserved) return;
+    reserved = false;
+    xhttpUploadBytes -= contentLength;
+  };
+  sock.once("close", release);
 
+  let done = false;
   function finish(fullBody: Buffer) {
+    if (done) return;
+    done = true;
+    sock.removeListener("data", onBody);
+    sock.setTimeout(0);
+    release();
     VERBOSE && console.log(`[xhttp] POST seq=${seq} len=${fullBody.length} (${clientIp}) id=${sessionId}`);
     xhttpProcessUpload(s!, seq, fullBody);
-    sock.end("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    // Backpressure: hold the ack while the remote write buffer is backed up
+    if (!s!.dead && s!.remote && s!.remote.writableLength > XHTTP_REMOTE_HIGH_WATER) {
+      VERBOSE && console.log(`[xhttp] remote backed up (${s!.remote.writableLength}B), holding ack seq=${seq} id=${sessionId}`);
+      s!.heldAcks.push(sock);
+      return;
+    }
+    sock.end(POST_OK);
+  }
+
+  let collected = Buffer.from(body);
+  function onBody(chunk: Buffer) {
+    collected = Buffer.concat([collected, chunk]);
+    if (collected.length >= contentLength) finish(collected.subarray(0, contentLength));
   }
 
   if (body.length >= contentLength) {
     finish(body.subarray(0, contentLength));
   } else {
     // need to read more data
-    let collected = Buffer.from(body);
-    sock.on("data", (chunk: Buffer) => {
-      collected = Buffer.concat([collected, chunk]);
-      if (collected.length >= contentLength) {
-        finish(collected.subarray(0, contentLength));
-      }
+    sock.on("data", onBody);
+    sock.setTimeout(HTTP_BODY_IDLE_TIMEOUT, () => {
+      VERBOSE && console.log(`[xhttp] POST body timeout seq=${seq} (${collected.length}/${contentLength}B) id=${sessionId}`);
+      sock.destroy();
     });
-    sock.on("error", () => sock.destroy());
   }
 }
 
@@ -512,6 +637,10 @@ const HTML = fs.readFileSync(path.join(process.cwd(), "public", "index.html"), "
 const server = net.createServer((sock) => {
   let buf = Buffer.alloc(0);
   let handled = false;
+  // Absolute deadline for the request headers (slowloris); cleared once routed
+  const headerTimer = setTimeout(() => {
+    if (!handled) { handled = true; sock.destroy(); }
+  }, HTTP_HEADER_TIMEOUT);
 
   function onData(chunk: Buffer) {
     if (handled) return;
@@ -525,6 +654,7 @@ const server = net.createServer((sock) => {
     }
 
     handled = true;
+    clearTimeout(headerTimer);
     sock.removeListener("data", onData);
 
     const headerPart = buf.subarray(0, idx).toString();
@@ -582,6 +712,16 @@ const server = net.createServer((sock) => {
 
   sock.on("data", onData);
   sock.on("error", () => sock.destroy());
+  sock.on("close", () => clearTimeout(headerTimer));
+});
+
+// Startup failures (e.g. port in use) exit with a clear message; later server errors are logged
+server.on("error", (err) => {
+  if (!server.listening) {
+    console.error(`[fatal] cannot listen on :${PORT}:`, err.message);
+    process.exit(1);
+  }
+  console.error("[server] error:", err.message);
 });
 
 server.listen(PORT, () => {

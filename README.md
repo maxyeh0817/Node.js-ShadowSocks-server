@@ -13,7 +13,7 @@ Zero-dependency Shadowsocks server with XHTTP transport, built on raw Node.js TC
 | Variable | Default | Description |
 |---|---|---|
 | `SERVER_PORT` | `20087` | Listening port |
-| `SS_PASSWORD` | `test123456` | Shadowsocks password |
+| `SS_PASSWORD` | *(required)* | Shadowsocks password — server exits with code 1 if unset |
 | `XHTTP_PATH` | `/xhttp` | XHTTP endpoint path prefix |
 | `VERBOSE` | `true` | Enable SS/XHTTP debug logging |
 
