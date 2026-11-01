@@ -38,7 +38,10 @@ const XHTTP_PATH = process.env.XHTTP_PATH || "/xhttp";
 const XHTTP_SESSION_TIMEOUT = 120_000;
 const XHTTP_MAX_PENDING = 30;  // out-of-order posts per session; same default as xray scMaxBufferedPosts
 const XHTTP_CLEANUP_INTERVAL = 5_000;
-const XHTTP_PENDING_MAX_AGE = 20_000;  // kill session if out-of-order posts wait this long for the gap
+const XHTTP_PENDING_MAX_AGE = 20_000;  // kill session if its oldest out-of-order post waits this long
+// xray (packet-up) opens the download GET while dialing, before its first upload POST,
+// so a session that never got a GET stream within this window is not a working client
+const XHTTP_NO_GET_TIMEOUT = 15_000;
 const XHTTP_MAX_BUFFER = 512 * 1024;  // 512KB buffer limit per session
 const XHTTP_MAX_SESSIONS = 200;  // max concurrent sessions for 512MB RAM
 const XHTTP_MAX_POST_BODY = 1024 * 1024;  // per POST; client post size must stay below this
@@ -53,6 +56,7 @@ const HTTP_HEADER_TIMEOUT = 15_000;  // a request's headers must complete within
 // more than HTTP_MAX_IDLE_CONNS are idle.
 const HTTP_MAX_IDLE_CONNS = 256;
 const HTTP_RESPONSE_HIGH_WATER = 64 * 1024;  // stop parsing requests while unread responses exceed
+const HTTP_RESPONSE_STALL_TIMEOUT = 60_000;  // close a connection whose responses stay unread this long
 const HTTP_BODY_BASE_TIMEOUT = 15_000;  // POST body deadline = base + contentLength / min rate
 const HTTP_BODY_MIN_RATE = 32 * 1024;  // bytes per second
 const VERBOSE = process.env.VERBOSE !== "false";
@@ -238,10 +242,12 @@ interface XHTTPSession {
   downSock: net.Socket | null;
   downReady: boolean;
   nextSeq: number;
-  pendingPosts: Map<number, Buffer>;
+  pendingPosts: Map<number, { data: Buffer; at: number }>;  // insertion order = arrival order
   pendingBytes: number;
-  pendingSince: number;  // when the current gap in the sequence started waiting (0 = no pending)
   blockedUploads: (() => void)[];
+  blockedSince: number;  // when uploads were paused by remote backpressure (0 = not paused)
+  createdAt: number;
+  hadGet: boolean;  // a GET download stream has been attached at least once
   dec: Decryptor | null;
   enc: Encryptor | null;
   ssBuf: Buffer;
@@ -325,8 +331,26 @@ function writeChunk(sock: net.Socket, data: Buffer): boolean {
 
 /* ─── XHTTP/SplitHTTP transport ─── */
 
+// At the session limit, make room by evicting the oldest session that has not proven it
+// knows the password (no remote yet): first those without a GET stream, then GET-only ones.
+// Sessions with a remote connection (authenticated) are never evicted.
+function xhttpEvictUnauthenticated(): boolean {
+  let getOnly: XHTTPSession | null = null;
+  for (const s of xhttpSessions.values()) {  // Map order = creation order, oldest first
+    if (s.remote) continue;
+    if (!s.downSock) {
+      xhttpDie(s, "evicted (session limit, no GET/remote)");
+      return true;
+    }
+    if (!getOnly) getOnly = s;
+  }
+  if (!getOnly) return false;
+  xhttpDie(getOnly, "evicted (session limit, no remote)");
+  return true;
+}
+
 function createXHTTPSession(id: string): XHTTPSession | null {
-  if (xhttpSessions.size >= XHTTP_MAX_SESSIONS) {
+  if (xhttpSessions.size >= XHTTP_MAX_SESSIONS && !xhttpEvictUnauthenticated()) {
     VERBOSE && console.log(`[xhttp] session limit reached (${XHTTP_MAX_SESSIONS}), rejecting id=${id}`);
     return null;
   }
@@ -339,8 +363,10 @@ function createXHTTPSession(id: string): XHTTPSession | null {
     nextSeq: 0,
     pendingPosts: new Map(),
     pendingBytes: 0,
-    pendingSince: 0,
     blockedUploads: [],
+    blockedSince: 0,
+    createdAt: Date.now(),
+    hadGet: false,
     dec: null,
     enc: null,
     ssBuf: Buffer.alloc(0),
@@ -374,6 +400,12 @@ function xhttpDie(s: XHTTPSession, reason?: string) {
 function xhttpResumeUploads(s: XHTTPSession) {
   const blocked = s.blockedUploads;
   s.blockedUploads = [];
+  if (s.blockedSince) {
+    // Time spent paused by our own backpressure does not count toward pending age
+    const paused = Date.now() - s.blockedSince;
+    for (const entry of s.pendingPosts.values()) entry.at += paused;
+    s.blockedSince = 0;
+  }
   for (const resume of blocked) resume();
 }
 
@@ -477,8 +509,7 @@ function xhttpProcessUpload(s: XHTTPSession, seq: number, payload: Buffer) {
       return;
     }
     VERBOSE && console.log(`[xhttp] out-of-order seq=${seq} (expect ${s.nextSeq}), queued (pending=${s.pendingPosts.size + 1}) id=${s.id}`);
-    s.pendingPosts.set(seq, payload);
-    if (!s.pendingSince) s.pendingSince = Date.now();
+    s.pendingPosts.set(seq, { data: payload, at: Date.now() });
     s.pendingBytes += payload.length;
     xhttpUploadBytes += payload.length;
     return;
@@ -490,7 +521,7 @@ function xhttpProcessUpload(s: XHTTPSession, seq: number, payload: Buffer) {
   s.lastActivity = Date.now();
   let drained = 0;
   while (s.pendingPosts.has(s.nextSeq)) {
-    const queued = s.pendingPosts.get(s.nextSeq)!;
+    const queued = s.pendingPosts.get(s.nextSeq)!.data;
     toProcess.push(queued);
     s.pendingBytes -= queued.length;
     xhttpUploadBytes -= queued.length;
@@ -499,8 +530,6 @@ function xhttpProcessUpload(s: XHTTPSession, seq: number, payload: Buffer) {
     drained++;
   }
   if (drained > 0) VERBOSE && console.log(`[xhttp] drained ${drained} pending packets, nextSeq=${s.nextSeq} id=${s.id}`);
-  // Progress was made: whatever is still pending waits on a new gap
-  s.pendingSince = s.pendingPosts.size ? Date.now() : 0;
 
   for (const data of toProcess) {
     if (s.dead) return;
@@ -547,12 +576,15 @@ function handleXHTTPGet(sock: net.Socket, sessionId: string, clientIp: string) {
   }
 
   s.downSock = sock;
+  s.hadGet = true;
   sock.setKeepAlive(true, 10_000);
   sock.setNoDelay(true);
   const xpad = crypto.randomBytes(100 + Math.floor(Math.random() * 156)).toString("base64");
   sock.write(
     "HTTP/1.1 200 OK\r\n" +
-    "Content-Type: application/octet-stream\r\n" +
+    // SSE content type makes middleboxes (CDN / reverse proxy) stream instead of buffer,
+    // same as xray's own server; the xray client only checks the status code
+    "Content-Type: text/event-stream\r\n" +
     "Transfer-Encoding: chunked\r\n" +
     "X-Accel-Buffering: no\r\n" +
     "Cache-Control: no-store\r\n" +
@@ -700,6 +732,7 @@ function handleXHTTPPost(
     if (!session.dead && session.remote && session.remote.writableLength > XHTTP_REMOTE_HIGH_WATER) {
       VERBOSE && console.log(`[xhttp] remote backed up (${session.remote.writableLength}B), pausing upload connection id=${sessionId}`);
       sock.pause();
+      if (!session.blockedUploads.length) session.blockedSince = Date.now();
       session.blockedUploads.push(() => {
         sock.resume();
         conn.next(rest);
@@ -760,7 +793,9 @@ const server = net.createServer((sock) => {
       // grow the write buffer without bound; stop reading until it drains
       if (sock.writableLength > HTTP_RESPONSE_HIGH_WATER) {
         sock.pause();
+        arm(HTTP_RESPONSE_STALL_TIMEOUT, "unread responses");
         sock.once("drain", () => {
+          disarm();
           sock.resume();
           conn.next(buf);
         });
@@ -781,7 +816,10 @@ const server = net.createServer((sock) => {
   arm(HTTP_HEADER_TIMEOUT, "header");
 
   function parseNext() {
-    if (detached || conn.sink || sock.destroyed || !buf.length) return;
+    if (detached || conn.sink || sock.destroyed) return;
+    // RFC 9112 §2.2: ignore empty lines (CRLF) received before a request line
+    while (buf.length >= 2 && buf[0] === 0x0d && buf[1] === 0x0a) buf = buf.subarray(2);
+    if (!buf.length) return;
     if (idle) {
       idle = false;
       idleConns.delete(sock);
@@ -911,8 +949,12 @@ setInterval(() => {
   for (const [id, s] of xhttpSessions) {
     if (now - s.lastActivity > XHTTP_SESSION_TIMEOUT) {
       xhttpDie(s, "timeout");
-    } else if (s.pendingSince && now - s.pendingSince > XHTTP_PENDING_MAX_AGE) {
-      xhttpDie(s, "pending posts expired");
+    } else if (!s.hadGet && now - s.createdAt > XHTTP_NO_GET_TIMEOUT) {
+      xhttpDie(s, "no GET stream");
+    } else if (s.pendingPosts.size && !s.blockedUploads.length) {
+      // Age of the oldest queued post: advancing the sequence elsewhere does not reset it
+      const oldest = s.pendingPosts.values().next().value!;
+      if (now - oldest.at > XHTTP_PENDING_MAX_AGE) xhttpDie(s, "pending posts expired");
     }
   }
 }, XHTTP_CLEANUP_INTERVAL);
